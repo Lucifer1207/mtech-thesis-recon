@@ -22,6 +22,8 @@ data/manual/  → 274 JSON files
 RAW data:    58,052 flows total, 4,652 leaks, 53,400 non-leaks
 
 
+ReCon Pipeline Complete Order of Execution for QAD :- Stage1a -> Stage 1b -> Stage 2b -> Stage_e8-qad .
+
 ReCon_pipeline/Stage1a_load_Dataset.py :- The primary purpose of stage1_load_data.py is to transform raw, noisy JSON network logs into a clean, structured, and machine-learning-ready format for training your model.
 
 ReCon_pipeline/Stage1b_demask_data.py :- This script is used to clean the data and remove markers like "RECON_" and output files "train_clean.json", "test_clean.json".
@@ -32,5 +34,4 @@ TRAIN :    41,797 total | PII=3,386  | Non-PII=38,411
 VALIDATE : 4,644 total | PII=356  | Non-PII=4,288 
 TEST :     11,611 total | PII=910 | Non-PII=10,701 
 
-
-
+ReCon_pipeline/stage_e8_qad.py :- This file is final step of ReCon pipeline. This trains student model(TinyBERT), using E8 Lattice Vector Quantization and using teacher_prob file(that gets generated after Stage2b). The teacher_model used here is:- FineTuned Teacher model(Bert-BASE) on cleaned dataset, that gets saved after Stage2b.

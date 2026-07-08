@@ -1,0 +1,139 @@
+"""
+stage1_load_data.py  (v2 — fixed)
+─────────────────────────────────────────────────────────────
+Loads raw ReCon JSON files, serializes each packet into text,
+splits 80/20 train/test.
+
+FIXES vs original:
+  - serialize_packet() now excludes 'pii_types' in addition to
+    'label'. pii_types directly reveals whether a packet is a
+    leak (non-null = leak, null = non-leak), making it a perfect
+    label leak if included in training text.
+  - Also excludes: 'tk_flag', 'ts', 'src_ip', 'src_port' since
+    these are metadata artifacts not present in real inference
+    scenarios and could cause spurious pattern learning.
+"""
+
+import json
+import os
+from pathlib import Path
+import random
+
+random.seed(42)
+
+DATA_DIR = Path("data")
+SUBFOLDERS = ["anubis", "auto", "manual"]
+
+# Fields to EXCLUDE from serialized text
+# label     → the target, never put in input
+# pii_types → directly reveals label (null=no leak, list=leak)
+# tk_flag   → internal annotation flag
+# ts        → timestamp, not a network traffic feature
+# src_ip    → client-side IP, not meaningful for PII detection
+# src_port  → same
+EXCLUDE_FIELDS = {"label", "pii_types", "tk_flag", "ts", "src_ip", "src_port"}
+
+
+def serialize_packet(packet):
+    """
+    Convert packet dict to text string by joining key:value pairs.
+    Matches Paper 2's Section 4.3 document classification approach.
+    Nested 'headers' dict is flattened into the same format.
+    All EXCLUDE_FIELDS are skipped.
+    """
+    parts = []
+    for key, value in packet.items():
+        if key in EXCLUDE_FIELDS:
+            continue
+        if key == "headers" and isinstance(value, dict):
+            for hkey, hval in value.items():
+                if value is not None:
+                    parts.append(f"{hkey}: {hval}")
+        else:
+            if value is not None:
+                parts.append(f"{key}: {value}")
+    return " ".join(parts)
+
+
+def load_all_packets():
+    packets = []
+    files_processed = 0
+    files_failed = 0
+
+    for subfolder in SUBFOLDERS:
+        folder = DATA_DIR / subfolder
+        if not folder.exists():
+            print(f"  WARNING: {folder} does not exist, skipping")
+            continue
+        for jsonfile in folder.rglob("*.json"):
+            try:
+                with open(jsonfile, 'r', encoding='utf-8', errors='ignore') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    for key, packet in data.items():
+                        if isinstance(packet, dict) and 'label' in packet:
+                            text = serialize_packet(packet)
+                            label = int(packet['label'])
+                            packets.append((text, label))
+                files_processed += 1
+            except Exception:
+                files_failed += 1
+
+    print(f"  Files processed: {files_processed}, failed: {files_failed}")
+    return packets
+
+
+def main():
+    print("=" * 60)
+    print("STAGE 1 (v2): Loading raw ReCon dataset")
+    print("Excluded fields:", EXCLUDE_FIELDS)
+    print("=" * 60)
+
+    packets = load_all_packets()
+
+    total = len(packets)
+    leaks = sum(1 for _, l in packets if l == 1)
+    nonleaks = total - leaks
+
+    print(f"\nTotal packets: {total:,}")
+    print(f"Leaks (label=1): {leaks:,} ({100*leaks/total:.2f}%)")
+    print(f"Non-leaks (label=0): {nonleaks:,} ({100*nonleaks/total:.2f}%)")
+
+    # Verify pii_types is NOT in any serialized text
+    sample_with_pii_type = sum(
+        1 for text, _ in packets if 'pii_types' in text.lower()
+    )
+    print(f"\nVerification — packets with 'pii_types' in text: "
+          f"{sample_with_pii_type} (should be 0)")
+
+    # Show one leak example to verify serialization looks correct
+    print("\n--- Example leak packet (first found) ---")
+    for text, label in packets:
+        if label == 1:
+            print(f"Label: {label}")
+            print(f"Text (first 300 chars): {text[:300]}...")
+            break
+
+    # Shuffle and 80/20 split
+    random.shuffle(packets)
+    split_idx = int(0.8 * len(packets))
+    train_packets = packets[:split_idx]
+    test_packets = packets[split_idx:]
+
+    print(f"\nTrain set: {len(train_packets):,}")
+    print(f"Test set:  {len(test_packets):,}")
+
+    os.makedirs("pipeline_data", exist_ok=True)
+    with open("pipeline_data/train.jsonl", "w") as f:
+        for text, label in train_packets:
+            f.write(json.dumps({"text": text, "label": label}) + "\n")
+    with open("pipeline_data/test.jsonl", "w") as f:
+        for text, label in test_packets:
+            f.write(json.dumps({"text": text, "label": label}) + "\n")
+
+    print("\nSaved train.jsonl and test.jsonl to pipeline_data/")
+    print("\nSTAGE 1 COMPLETE")
+
+
+if __name__ == "__main__":
+    main()

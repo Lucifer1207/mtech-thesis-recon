@@ -24,4 +24,13 @@ RAW data:    58,052 flows total, 4,652 leaks, 53,400 non-leaks
 
 ReCon_pipeline/Stage1a_load_Dataset.py :- The primary purpose of stage1_load_data.py is to transform raw, noisy JSON network logs into a clean, structured, and machine-learning-ready format for training your model.
 
-ReCon_pipeline/Stage1b_demask_data.py :- This script is used to clean the data and remove markers like "RECON_" and output files "train_clean.json", "test_clean.json"
+ReCon_pipeline/Stage1b_demask_data.py :- This script is used to clean the data and remove markers like "RECON_" and output files "train_clean.json", "test_clean.json".
+
+ReCon_pipeline/Stage2b_train_teacher.py :- This file is Fine-Tuning BERT-Base FP32 model. Additionally, it generates "teacher_train_probs.json" , which contains the output probabilities (soft labels) that your Student model will need for distillation.Hence, this model can be used as Teacher Model. The script follows this Train/test/validate split:- 
+
+TRAIN :    41,797 total | PII=3,386  | Non-PII=38,411 
+VALIDATE : 4,644 total | PII=356  | Non-PII=4,288 
+TEST :     11,611 total | PII=910 | Non-PII=10,701 
+
+
+

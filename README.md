@@ -14,3 +14,9 @@ Bits   E8 SNR    Z8 SNR    E8 Advantage
 6      3.002 dB  2.841 dB  +0.161 dB  (E8 wins clearly)
 8      4.067 dB  4.179 dB  -0.112 dB  (Z8 wins slightly)
 
+DataSet Details:-
+data/anubis/  → 574 JSON files
+data/auto/    → 565 JSON files
+data/manual/  → 274 JSON files
+
+RAW data:    58,052 flows total, 4,652 leaks, 53,400 non-leaks

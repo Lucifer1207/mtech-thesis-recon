@@ -1,0 +1,14 @@
+Step 1 — Tap "Allow" on that popup now, so basic file access works.
+
+Step 2 — Re-enable Developer Options on the phone:
+
+Settings → About Phone → Software Information (if present) →
+tap "Build Number" 7 times rapidly → "Developer mode enabled" toast appears
+
+Step 3 — Enable USB Debugging:
+
+Settings → Developer Options → toggle "USB Debugging" ON
+
+Step 4 — Reconnect and approve the new popup that will appear:
+
+adb devices

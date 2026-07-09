@@ -36,4 +36,6 @@ TEST :     11,611 total | PII=910 | Non-PII=10,701
 
 ReCon_pipeline/stage_e8_qad.py :- This file is final step of ReCon pipeline. This trains student model(TinyBERT), using E8 Lattice Vector Quantization and using teacher_prob file(that gets generated after Stage2b). The teacher_model used here is:- FineTuned Teacher model(Bert-BASE) on cleaned dataset, that gets saved after Stage2b.
 
+ReCon_pipeline/export_qad_recon_models.py :- this file is used to create .bin for student_model_lattice_e8(that gets created after stage_e8_qad.py run. This student_model_lattice_e8 is trained QAD student(TinyBERT) using teacher as BERT-Base.
+
 FP32_scripts folder :- This folder contains 2 files, one for fp32 tinybert, and one for fp32 bert base.

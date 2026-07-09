@@ -4,7 +4,7 @@ export_all_models_v2.py :- The primary purpose of export_all_models_v2.py is to 
 
 usb_debugging.txt :- this is a text file which include steps to allow usb debugging in your android mobile phone.
 
-full_model_benchmark_v2.cpp :- Its primary purpose is to measure and verify how these models behave when executed on a target architecture (such as an Android device via adb).
+full_model_benchmark_v2.cpp :- Its primary purpose is to measure and verify how these models behave when executed on a target architecture (such as an Android device via adb).It basically creates ELF file.
 
 E8_Vs-Z8_Distortion.py :- Both E8 and Z8 must use the SAME number of codewords (same bit budget). For a fair test, generate N random 8D vectors, quantize each one using BOTH E8 and Z8, measure reconstruction error for both, compare. RESULTS will be as follows:- 
 Bits   E8 SNR    Z8 SNR    E8 Advantage
@@ -37,5 +37,7 @@ TEST :     11,611 total | PII=910 | Non-PII=10,701
 ReCon_pipeline/stage_e8_qad.py :- This file is final step of ReCon pipeline. This trains student model(TinyBERT), using E8 Lattice Vector Quantization and using teacher_prob file(that gets generated after Stage2b). The teacher_model used here is:- FineTuned Teacher model(Bert-BASE) on cleaned dataset, that gets saved after Stage2b.
 
 ReCon_pipeline/export_qad_recon_models.py :- this file is used to create .bin for student_model_lattice_e8(that gets created after stage_e8_qad.py run. This student_model_lattice_e8 is trained QAD student(TinyBERT) using teacher as BERT-Base.
+
+ReCon_pipeline/full_model_benchmark_recon.cpp :- Its primary purpose is to measure and verify how these models behave when executed on a target architecture (such as an Android device via adb). It basically creates ELF file.  
 
 FP32_scripts folder :- This folder contains 2 files, one for fp32 tinybert, and one for fp32 bert base.

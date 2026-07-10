@@ -41,3 +41,5 @@ ReCon_pipeline/export_qad_recon_models.py :- this file is used to create .bin fo
 ReCon_pipeline/full_model_benchmark_recon.cpp :- Its primary purpose is to measure and verify how these models behave when executed on a target architecture (such as an Android device via adb). It basically creates ELF file.  
 
 FP32_scripts folder :- This folder contains 2 files, one for fp32 tinybert, and one for fp32 bert base.
+
+QAT_Scripts/stage_all_qat.py:- This script performs Quantization-Aware Training (QAT) on BERT-Base and TinyBERT using E8 lattice and Z8 scalar quantization to optimize models for mobile deployment.

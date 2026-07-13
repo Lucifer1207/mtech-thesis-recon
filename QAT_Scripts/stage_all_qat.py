@@ -1,9 +1,24 @@
 """
-stage_qat_all.py (v3 — fixed STE / shadow-weight bug)
+stage_qat_all.py (v4 — unified scale convention with export/on-device format)
 ─────────────────────────────────────────────────────────────
 QAT for BERT-Base and TinyBERT with E8 and Z8 quantization.
 
-FIX vs v2:
+FIX vs v3:
+  v3 computed one scale per 8-element sub-vector (4 independent
+  scales per 32-weight block). The export script and the C++
+  on-device harness both store exactly ONE scale per 32-element
+  block (struct block_e8_8 { float scale; uint8_t idx[4]; }).
+  This mismatch meant the weights actually shipped to the phone
+  would not be the same quantized values validated on the GPU.
+
+  v4 computes ONE shared scale per 32-element block (S = max(|block|)/2),
+  then splits that block into its 4 sub-vectors of 8 for the E8/Z8
+  codebook lookup, reusing the same shared scale for all 4. This is
+  now byte-for-byte consistent with export_e8_8bit/export_z8_8bit
+  and with the on-device block_e8_8/block_z8_8 struct — no export or
+  struct changes needed on top of this, only a re-run of QAT.
+
+FIX vs v2 (carried over from v3):
   v2 used a forward_pre_hook that overwrote `module.weight.data`
   with the quantized value on every forward pass. This destroyed
   the full-precision "shadow" weight the optimizer needs: every
@@ -152,16 +167,21 @@ class LatticeQuantizeFn(torch.autograd.Function):
     Vectorized lattice quantization with STE.
 
     FORWARD (all on GPU, no Python loops):
-      1. Flatten weight to 1D, pad to multiple of 8
-      2. Reshape to (num_blocks, 8)
-      3. Compute scale per block: S = max(|block|) / 2
-      4. Scale blocks: blocks_scaled = blocks / S
-      5. Compute distances to ALL codebook entries simultaneously:
-         dist[i,j] = ||blocks_scaled[i] - codebook[j]||^2
-         using: ||a-b||^2 = ||a||^2 - 2*a·b + ||b||^2
-      6. Find nearest codeword index: argmin over codebook dim
-      7. Gather nearest codewords, multiply by scale S
+      1. Flatten weight to 1D, pad to multiple of 32
+      2. Reshape to (num_blocks, 32)
+      3. Compute ONE scale per 32-element block: S = max(|block|) / 2
+      4. Scale block: block_scaled = block / S
+      5. Split each scaled 32-block into 4 sub-vectors of 8, and for
+         each sub-vector compute distances to ALL codebook entries:
+         dist[i,j] = ||subvec_i - codebook[j]||^2
+      6. Find nearest codeword index per sub-vector: argmin over codebook dim
+      7. Gather nearest codewords, reassemble the 4 sub-vectors back
+         into a 32-block, multiply by the ONE shared scale S
       8. Reshape back to original weight shape
+
+    This block/scale layout is now identical to export_e8_8bit /
+    export_z8_8bit and to the on-device block_e8_8/block_z8_8 struct
+    (float scale + 4x uint8 index = 8 bytes/32 weights = 2.0 bits/weight).
 
     BACKWARD: gradient passes straight through (STE) to whatever
     tensor was passed in as `weight` — this is only useful for
@@ -176,30 +196,41 @@ class LatticeQuantizeFn(torch.autograd.Function):
         orig_shape = weight.shape
         flat = weight.detach().reshape(-1).float()
 
-        # Pad to multiple of 8
-        rem = flat.shape[0] % 8
-        pad = (8 - rem) % 8
+        # Pad to multiple of 32 — block size now matches the on-device
+        # format exactly: ONE shared scale per 32 elements, split into
+        # 4 sub-vectors of 8 for the E8/Z8 codebook lookup.
+        rem = flat.shape[0] % 32
+        pad = (32 - rem) % 32
         if pad:
             flat = torch.cat([flat, torch.zeros(pad, device=flat.device)])
 
-        blocks = flat.reshape(-1, 8)          # (B, 8)
+        blocks32 = flat.reshape(-1, 32)       # (B32, 32)
 
-        # Per-block scale factor: S = max(|block|) / 2
-        S = blocks.abs().max(dim=1, keepdim=True).values / 2.0
-        S = S.clamp(min=1e-8)
-        blocks_scaled = blocks / S            # (B, 8), normalised
+        # ONE scale per 32-element block: S = max(|block|) / 2
+        # (identical formula/granularity to export_e8_8bit / export_z8_8bit)
+        S = blocks32.abs().max(dim=1, keepdim=True).values / 2.0
+        S = S.clamp(min=1e-8)                 # (B32, 1)
+        blocks32_scaled = blocks32 / S        # (B32, 32), normalised by shared scale
+
+        # Split each 32-block into its 4 sub-vectors of 8 for lookup
+        B32 = blocks32_scaled.shape[0]
+        subvecs = blocks32_scaled.reshape(B32 * 4, 8)   # (B32*4, 8)
 
         # Vectorized nearest-neighbour:
         # dist(i,j) = ||b_i - c_j||^2 = ||b_i||^2 - 2*b_i·c_j + ||c_j||^2
         CB = codebook.float()                 # (N, 8)
-        b_norm = (blocks_scaled ** 2).sum(dim=1, keepdim=True)   # (B, 1)
-        c_norm = (CB ** 2).sum(dim=1).unsqueeze(0)               # (1, N)
-        dot    = blocks_scaled @ CB.T                             # (B, N)
-        dists  = b_norm - 2 * dot + c_norm                       # (B, N)
+        b_norm = (subvecs ** 2).sum(dim=1, keepdim=True)          # (B32*4, 1)
+        c_norm = (CB ** 2).sum(dim=1).unsqueeze(0)                # (1, N)
+        dot    = subvecs @ CB.T                                    # (B32*4, N)
+        dists  = b_norm - 2 * dot + c_norm                        # (B32*4, N)
 
-        best_idx  = dists.argmin(dim=1)                          # (B,)
-        best_code = CB[best_idx]                                  # (B, 8)
-        result    = best_code * S                                 # (B, 8)
+        best_idx  = dists.argmin(dim=1)                           # (B32*4,)
+        best_code = CB[best_idx]                                   # (B32*4, 8)
+
+        # Reassemble the 4 sub-vectors back into 32-blocks and apply
+        # the ONE shared scale (broadcasts across all 32 elements)
+        best_code_32 = best_code.reshape(B32, 32)                 # (B32, 32)
+        result = best_code_32 * S                                  # (B32, 32)
 
         # Reshape back
         result_flat = result.reshape(-1)
@@ -394,7 +425,7 @@ def run_qat(model_name, model_source, codebook, quant_type,
     opt  = torch.optim.AdamW(model.parameters(), lr=lr)
     sch  = get_linear_schedule_with_warmup(opt,0,len(tl)*epochs)
 
-    save_dir = f"qat_{model_name.replace('-','_').lower()}_{quant_type.lower()}"
+    save_dir = f"qat_{model_name.replace('-','_').lower()}_{quant_type.lower()}_v4"
     os.makedirs(save_dir, exist_ok=True)
 
     best_f1  = -1.0          # -1 so even an epoch scoring 0.0 F1 gets kept as a fallback

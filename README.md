@@ -44,6 +44,9 @@ FP32_scripts folder :- This folder contains 2 files, one for fp32 tinybert, and 
 
 QAT_Scripts/stage_all_qat.py:- This script performs Quantization-Aware Training (QAT) on BERT-Base and TinyBERT using E8 lattice and Z8 scalar quantization to optimize models for mobile deployment.
 
+
+QAT_Scripts/stage_all_qat_normalization.py :- The purpose of the stage_qat_all_normalization.py script is to implement theoretically grounded, paper-compliant row-wise dynamic-range calibration for Lattice-based Quantization-Aware Training (QAT).
+
 QAT_Scripts/export_all_qat_models.py:- While your training script (stage_qat_all.py) learns the weights, it stores them in a format that your mobile device's C++ inference engine cannot understand. This export script converts those trained weights into raw binary files that your C++ benchmark can load directly into memory.
 
 

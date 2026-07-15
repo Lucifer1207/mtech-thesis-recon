@@ -188,16 +188,32 @@ def build_z8_codebook(bits, device):
 #   Y_max = Delta0 * (q^M - 1) / 2
 #   beta_i = Y_max / (C_b * sigma_i)      -- per output row i
 #
-# Our fixed 256-entry (8-bit) E8/Z8 codebook = paper's q=256, M=1
-# (one direct nearest-of-256 lookup, no hierarchical residual digits
-# -- matches the paper's own "fused" QAT simplification).
+# FIX: Y_max is now derived EMPIRICALLY from the codebook's own
+# coordinate range (computed inside forward(), from the `codebook`
+# tensor it already receives), instead of assumed from a (q,M) pair.
+#
+# Why: our fixed 256-entry codebook only contains E8/Z8 points with
+# small coordinates (max |coordinate| = 1.5 for our E8-256 codebook).
+# The paper's (q,M)-derived Y_max formula assumes a codebook/lattice
+# search that scales WITH Y_max (either a properly hierarchical HNLQ
+# construction, or an unbounded lattice search that can represent
+# arbitrarily large points). Our codebook is a small FIXED lookup
+# table, so plugging in q=256 gave Y_max=191.25 -- 127x larger than
+# what the codebook can represent (confirmed empirically: max
+# |coordinate| across the 256-point codebook is 1.5). Every row-scaled
+# weight then landed far outside the codebook's coverage and snapped
+# to a boundary codeword regardless of its true value, destroying all
+# signal -- this is exactly what caused the F1=0.00%/constant-
+# majority-class collapse in the first normalized run.
+#
+# Grounding Y_max in the codebook's own range keeps the paper's core
+# mechanism (row-wise beta = Y_max/(C_b*sigma)) exactly as specified,
+# while guaranteeing scaled weights actually land within what the
+# codebook can represent.
 # ═══════════════════════════════════════════════════════════
-DELTA0    = 1.5     # paper's more stable setting for Exact projection (vs 0.3)
-C_B       = 5.0     # paper's fixed row-safety constant ("5-sigma range per row")
-LATTICE_Q = 256     # matches our fixed 256-point (8-bit) codebook
-LATTICE_M = 1       # single direct lookup, no hierarchical digits
-CLIP_TAU  = None    # optional clip (paper: "optional element-wise clipping for
-                    # numerical stability"); set a float to enable, e.g. 6.0
+C_B      = 5.0     # paper's fixed row-safety constant ("5-sigma range per row")
+CLIP_TAU = None    # optional clip (paper: "optional element-wise clipping for
+                   # numerical stability"); set a float to enable, e.g. 6.0
 
 # ═══════════════════════════════════════════════════════════
 # SECTION 2: VECTORIZED STE QUANTIZATION
@@ -237,7 +253,10 @@ class LatticeQuantizeFn(torch.autograd.Function):
         W = weight.detach().float()          # (O, I)
 
         # ---- Paper's row-wise dynamic-range calibration ----
-        Y_max = DELTA0 * (LATTICE_Q ** LATTICE_M - 1) / 2.0
+        # Y_max grounded in the codebook's own coordinate range (see
+        # note above) -- NOT the (q,M) formula, which overshot 127x
+        # for our fixed small codebook.
+        Y_max = codebook.abs().max().item()
         sigma = W.std(dim=1, unbiased=False, keepdim=True).clamp(min=1e-8)  # (O,1)
         beta  = Y_max / (C_B * sigma)                                       # (O,1)
         W_tilde = W * beta                                                    # (O,I)

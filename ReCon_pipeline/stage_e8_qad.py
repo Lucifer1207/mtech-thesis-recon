@@ -1,5 +1,5 @@
 """
-stage3b_e8_lattice_qad.py
+stage3b_e8_lattice_qad.py (v2 -- fixed checkpoint-save bug)
 ─────────────────────────────────────────────────────────────
 True E8 Lattice Quantization-Aware Distillation (QAD) Script.
 Replaces scalar uniform simulation with explicit 8D block projection.
@@ -10,6 +10,27 @@ Block Format (C++ Struct Aligned):
   - Divided into 4 consecutive 8D vectors mapped directly onto 
     the 256-element E8 8-bit codebook.
   - Uses Straight-Through Estimation (STE) for autograd.
+
+FIX vs v1:
+  E8QuantizedLinear.forward() computes quantization transiently on
+  every forward pass (STE), but never wrote that quantized value back
+  into self.weight. student.save_pretrained(...) therefore saved the
+  raw, continuous, UNQUANTIZED shadow weight -- not what
+  evaluate_model() was actually measuring live. Downstream export
+  scripts loading that checkpoint were doing fresh post-hoc
+  quantization on non-lattice-aligned weights, which is why SNR came
+  out low (~3.87dB) despite training/eval F1 numbers being correct.
+
+  v2 adds get_quantized_state_dict(), which folds every
+  E8QuantizedLinear's weight into its quantized (on-lattice)
+  reconstruction on a CLONED copy of the state_dict -- never in-place
+  on the live model, since doing so in-place would destroy the fp32
+  shadow weight needed for further AdamW updates (the same class of
+  bug already fixed once in this thesis's stage_qat_all.py). The
+  checkpoint saved via save_pretrained(..., state_dict=quantized_sd)
+  now genuinely contains lattice-quantized values, directly exportable
+  and decomposable losslessly (matching the approach validated for
+  the BERT-Base/TinyBERT QAT export pipeline).
 """
 
 import json
@@ -149,6 +170,49 @@ def transform_to_e8_lattice(model, codebook_np):
             setattr(model, name, E8QuantizedLinear(child, codebook_np))
         else:
             transform_to_e8_lattice(child, codebook_np)
+
+
+def get_quantized_state_dict(model):
+    """
+    Returns a NEW state_dict in which every E8QuantizedLinear's weight
+    has been folded into its quantized (on-lattice) reconstruction --
+    the identical computation E8QuantizedLinear.forward() applies
+    transiently every forward pass via STE, but persisted here so the
+    SAVED checkpoint actually matches what evaluate_model() measures
+    live (which always re-quantizes on the fly, regardless of what
+    save_pretrained happens to write to disk).
+
+    IMPORTANT: this computes on a CLONED copy of each state_dict
+    tensor and must NEVER be applied in-place to the live model's
+    module.weight.data during training. Doing so would permanently
+    destroy the fp32 shadow weight that AdamW needs for further
+    updates -- the exact class of bug already fixed once in this
+    thesis's QAT pipeline (stage_qat_all.py's original hook-based
+    quantizer). Here, the live `model` is left completely untouched;
+    only the returned state_dict differs from model.state_dict().
+    """
+    sd = model.state_dict()
+    quantized_sd = {k: v.clone() for k, v in sd.items()}
+
+    for name, module in model.named_modules():
+        if isinstance(module, E8QuantizedLinear):
+            W = module.weight.data
+            orig_shape = W.shape
+            W_flat = W.reshape(-1, 32)
+            max_vals = torch.max(torch.abs(W_flat), dim=1, keepdim=True)[0]
+            scales = torch.clamp(max_vals / 2.0, min=1e-8)
+            W_8d = (W_flat / scales).reshape(-1, 8)
+            W_quant_8d = module.quantizer(W_8d)
+            W_quant_flat = W_quant_8d.reshape(-1, 32)
+            W_folded = (W_quant_flat * scales).reshape(orig_shape)
+
+            weight_key = f"{name}.weight"
+            assert weight_key in quantized_sd, f"key {weight_key} missing from state_dict"
+            quantized_sd[weight_key] = W_folded.detach().cpu().clone()
+            # bias (if any) is intentionally left untouched -- it was
+            # never quantized during training either.
+
+    return quantized_sd
 
 # ─────────────────────────────────────────────────────────────
 # 4. Dataset Class Pipeline
@@ -311,8 +375,9 @@ def main():
         
         if val_metrics["f1"] > best_val_f1:
             best_val_f1 = val_metrics["f1"]
-            student.save_pretrained("student_model_lattice_e8")
-            print(f"  🆕 Checkpoint Saved! Best Val F1: {best_val_f1*100:.2f}%")
+            quantized_sd = get_quantized_state_dict(student)
+            student.save_pretrained("student_model_lattice_e8", state_dict=quantized_sd)
+            print(f"  🆕 Checkpoint Saved (quantized weights folded)! Best Val F1: {best_val_f1*100:.2f}%")
 
     print(f"\nTraining completed in {(time.time() - t_start)/60:.2f} minutes.")
     
@@ -322,8 +387,21 @@ def main():
     print("\n" + "=" * 65)
     print("RUNNING FINAL TEST EVALUATION ON BEST CHECKPOINT")
     print("=" * 65)
+    # NOTE: the saved checkpoint already contains FOLDED (quantized,
+    # on-lattice) weights -- get_quantized_state_dict() baked them in
+    # before save_pretrained(). Do NOT call transform_to_e8_lattice()
+    # here: that would wrap already-quantized weights in a fresh
+    # E8QuantizedLinear, whose forward() re-derives scale via
+    # max(|block|)/2 on values that are already on-lattice -- the same
+    # naive-re-derivation bug fixed in the QAT export pipeline (it
+    # only recovers the true scale if a codeword's max-abs component
+    # happens to be exactly 2, which most don't). Applied on every
+    # layer, every forward pass, that mismatch compounds into the
+    # complete classifier collapse seen in the first run of this
+    # script (F1=0.00%). A plain nn.Linear forward pass on already-
+    # folded weights already IS the quantized computation -- nothing
+    # left to re-derive.
     best_student = AutoModelForSequenceClassification.from_pretrained("student_model_lattice_e8")
-    transform_to_e8_lattice(best_student, codebook_np)
     best_student = best_student.to(device)
     evaluate_model(best_student, test_loader, description="Final E8 Lattice QAD Student Test")
 

@@ -1,267 +1,232 @@
-"""export_all_models.py
+"""
+export_qad_recon_models.py (v2 -- corrected)
 ────────────────────────────────────────────────────────────────
-Exports ALL models to binary files including BOTH E8 variants:
+Exports the TinyBERT E8-lattice QAD student (from stage_e8_qad.py v2)
+to a binary block file for full_model_benchmark_qad.cpp.
 
-  1. BERT-Base FP32         → bert_full_fp32.bin
-  2. BERT-Base E8 16-bit    → bert_full_e8_16bit.bin  (3.0 bits/weight)
-  3. BERT-Base E8 8-bit     → bert_full_e8_8bit.bin   (2.0 bits/weight)
-  4. DistilBERT FP32        → distilbert_full_fp32.bin
-  5. MobileBERT FP32        → mobilebert_full_fp32.bin
-  6. TinyBERT (4L) FP32     → tinybert_full_fp32.bin
-  7. bert_codebook_e8_16bit.bin  (65536 × 8D × 4B = 2 MB)
-  8. bert_codebook_e8_8bit.bin   (256   × 8D × 4B = 8 KB)
+FIXES vs v1:
+  1. Loaded via AutoModel instead of AutoModelForSequenceClassification
+     -- inconsistent with how the checkpoint was actually created
+     (a sequence-classification model), silently dropping/ignoring
+     the classifier head's structure.
+  2. Built its OWN E8 codebook using a DIFFERENT construction
+     (lexicographic tie-break + a norm²≤4 cutoff filter) than
+     stage_e8_qad.py's training-time codebook (pure norm-sort, no
+     shuffle, no cutoff). Even though both aim for "256 closest E8
+     points", a different tie-break rule at the shell boundary can
+     select a different subset -- meaning indices wouldn't mean the
+     same lattice points as during training. Codebook-building code
+     here is now copied verbatim from stage_e8_qad.py.
+  3. Re-derived scale via max(|already-quantized block|)/2, which
+     only works on RAW unquantized weights (this is now moot since
+     v2 of stage_e8_qad.py saves genuinely folded/quantized weights,
+     but the same exact-decomposition method validated for the
+     BERT-Base/TinyBERT QAT export is used here anyway, for identical
+     lossless-recovery guarantees and to stay consistent with the
+     rest of the pipeline).
+  4. Was quantizing the ENTIRE state_dict rather than only the Linear
+     layers that were actually QAT-wrapped (excludes "classifier",
+     matching stage_e8_qad.py's transform_to_e8_lattice exactly).
 
-Block formats:
-  FP32 block    : 32 × float32                        = 128 bytes
-  E8 16-bit blk : float32 scale + 4 × uint16 indices  =  12 bytes
-  E8 8-bit  blk : float32 scale + 4 × uint8  indices  =   8 bytes
-
-Effective bits/weight:
-  E8 16-bit : (32 scale bits + 4×16 index bits) / 32 = 3.0 bits/weight
-  E8 8-bit  : (32 scale bits + 4×8  index bits) / 32 = 2.0 bits/weight
-
-NOTE (v2 change): file sizes are now read directly from disk using
-os.path.getsize() instead of being computed manually, and BOTH MiB
-(1024-based) and MB (1000-based) are printed to avoid ambiguity.
+Output: tinybert_e8_qad_quant.bin (block_e8_8 format, 8 bytes/32
+weights) + tinybert_e8_qad_codebook_8bit.bin (256x8 float32, this
+QAD-specific codebook -- NOT the same file as the QAT pipeline's
+E8 codebook, since the two are built with different code and are
+not guaranteed to be identical; mixing them would silently corrupt
+decoding).
 """
 
-import numpy as np
 import struct
-import itertools
 import os
-from transformers import AutoModel
+from itertools import product
+
+import numpy as np
+import torch
+import torch.nn as nn
+from transformers import AutoModelForSequenceClassification
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-BLOCK_SIZE = 32   # weights per block
+BLOCK_SIZE = 32
+CKPT_DIR   = "student_model_lattice_e8"
+OUT_QUANT  = "tinybert_e8_qad_quant.bin"
+OUT_CODEBOOK = "tinybert_e8_qad_codebook_8bit.bin"
+
 
 # ─────────────────────────────────────────────────────────────
-#  Helper: get true file size from disk, in both MiB and MB
+# 1. Codebook builder -- copied verbatim from stage_e8_qad.py so
+#    the 256-point set exactly matches what training used.
 # ─────────────────────────────────────────────────────────────
-def get_size_mib_mb(filepath):
-    size_bytes = os.path.getsize(filepath)
-    size_mib = size_bytes / (1024 * 1024)
-    size_mb  = size_bytes / (1000 * 1000)
-    return size_bytes, size_mib, size_mb
+def is_e8_point(x, tol=1e-6):
+    x = np.array(x, dtype=float)
+    is_integer = np.all(np.abs(x - np.round(x)) < tol)
+    is_half_integer = np.all(np.abs(x - np.round(x - 0.5) - 0.5) < tol)
+    sum_val = np.sum(x)
+    is_even_sum = (np.abs(sum_val - np.round(sum_val)) < tol and
+                   int(np.round(sum_val)) % 2 == 0)
+    return (is_integer or is_half_integer) and is_even_sum
+
+
+def generate_e8_8bit_codebook():
+    print("Building E8 codebook (identical to stage_e8_qad.py)...")
+    candidates = []
+    for coords in product([-2, -1, 0, 1, 2], repeat=8):
+        x = np.array(coords, dtype=float)
+        if is_e8_point(x):
+            candidates.append((float(np.dot(x, x)), x))
+    for coords in product([-1.5, -0.5, 0.5, 1.5], repeat=8):
+        x = np.array(coords, dtype=float)
+        if is_e8_point(x):
+            candidates.append((float(np.dot(x, x)), x))
+    candidates.sort(key=lambda item: item[0])   # matches stage_e8_qad.py exactly
+    codebook = [item[1] for item in candidates[:256]]
+    print(f"  Codebook = 256 closest E8 points")
+    return np.array(codebook, dtype=np.float32)
+
 
 # ─────────────────────────────────────────────────────────────
-#  Helper: flatten all state_dict weights → zero-pad → return
+# 2. Identify which .weight tensors were actually QAT/QAD-wrapped
+#    (mirrors stage_e8_qad.py's transform_to_e8_lattice exactly:
+#    every nn.Linear except a child literally named "classifier")
 # ─────────────────────────────────────────────────────────────
-def get_flat_weights(model):
-    all_flat = np.concatenate([
-        t.detach().cpu().numpy().astype(np.float32).flatten()
-        for t in model.state_dict().values()
-    ])
-    rem = len(all_flat) % BLOCK_SIZE
-    if rem:
-        all_flat = np.concatenate(
-            [all_flat, np.zeros(BLOCK_SIZE - rem, dtype=np.float32)])
-    return all_flat
+def get_qad_target_names(model):
+    targets = set()
+    for name, module in model.named_modules():
+        for child_name, child in module.named_children():
+            if isinstance(child, nn.Linear):
+                if "classifier" in child_name:
+                    continue
+                full_name = f"{name}.{child_name}" if name else child_name
+                targets.add(f"{full_name}.weight")
+    return targets
+
 
 # ─────────────────────────────────────────────────────────────
-#  Helper: write FP32 binary
+# 3. Exact decomposition of already-quantized blocks (identical
+#    method validated for the BERT-Base/TinyBERT QAT export --
+#    least-squares scalar fit against every codeword, positive-scale
+#    constrained, using whichever of the 4 sub-vectors has the
+#    largest norm as the reference for recovering the shared scale).
 # ─────────────────────────────────────────────────────────────
-def export_fp32(all_flat, out_file):
+def export_lattice_8bit(all_flat, codebook, out_file, chunk=20000):
+    assert len(all_flat) % BLOCK_SIZE == 0, (
+        f"Flat weight count {len(all_flat)} not a multiple of {BLOCK_SIZE}"
+    )
+    codebook_norms = np.sum(codebook ** 2, axis=1)
     num_blocks = len(all_flat) // BLOCK_SIZE
-    with open(out_file, "wb") as f:
-        f.write(struct.pack("<I", num_blocks))
-        f.write(all_flat.tobytes())
-    size_bytes, size_mib, size_mb = get_size_mib_mb(out_file)
-    print(f"    FP32 → {out_file}  ({num_blocks:,} blocks, "
-          f"{size_bytes:,} bytes, {size_mib:.2f} MiB, {size_mb:.2f} MB)")
-    return num_blocks, size_mib, size_mb
+    blocks = all_flat.reshape(num_blocks, 4, 8)
 
-# ─────────────────────────────────────────────────────────────
-#  Helper: write E8 16-bit binary
-#  Block: float32 scale (4B) + 4 × uint16 indices (8B) = 12B
-# ─────────────────────────────────────────────────────────────
-def export_e8_16bit(all_flat, codebook, codebook_norms, out_file):
-    num_blocks = len(all_flat) // BLOCK_SIZE
-    blocks = all_flat.reshape(num_blocks, BLOCK_SIZE)
+    out_dtype = np.dtype([("scale", "<f4"), ("idx", "u1", (4,))])
     total_sq_err = 0.0
     total_sq_sig = 0.0
 
     with open(out_file, "wb") as f:
         f.write(struct.pack("<I", num_blocks))
-        for i, block in enumerate(blocks):
-            if i % 200000 == 0:
-                print(f"      E8-16bit block {i:,}/{num_blocks:,}...")
-            max_val = float(np.max(np.abs(block)))
-            scale   = float(max_val / 2.0) if max_val > 1e-8 else 1e-8
-            subvecs = (block / scale).reshape(4, 8)
-            dots    = np.dot(codebook, subvecs.T)
-            dists   = codebook_norms[:, None] - 2 * dots
-            best    = np.argmin(dists, axis=0).astype(np.uint16)
-            recon   = codebook[best].flatten() * scale
-            total_sq_err += float(np.sum((recon - block)**2))
-            total_sq_sig += float(np.sum(block**2))
-            f.write(struct.pack("<f", scale))
-            f.write(best.tobytes())
+        for start in range(0, num_blocks, chunk):
+            end = min(start + chunk, num_blocks)
+            blk = blocks[start:end]
+            b = blk.shape[0]
 
-    size_bytes, size_mib, size_mb = get_size_mib_mb(out_file)
+            norms4 = np.sum(blk ** 2, axis=2)
+            ref = np.argmax(norms4, axis=1)
+            v_ref = blk[np.arange(b), ref, :]
+
+            dots = v_ref @ codebook.T
+            alphas = dots / (codebook_norms[None, :] + 1e-12)
+            vref_norm2 = np.sum(v_ref ** 2, axis=1, keepdims=True)
+            resid = vref_norm2 - alphas * dots
+            resid = np.where(alphas > 1e-9, resid, np.inf)   # positive-scale only
+            best_j = np.argmin(resid, axis=1)
+            S = alphas[np.arange(b), best_j]
+            S = np.where(~np.isfinite(S) | (np.abs(S) < 1e-12), 1e-8, S)
+
+            idxs = np.zeros((b, 4), dtype=np.uint8)
+            idxs[np.arange(b), ref] = best_j.astype(np.uint8)
+
+            for i in range(4):
+                mask = (ref != i)
+                if not np.any(mask):
+                    continue
+                v = blk[mask, i, :]
+                s_m = S[mask][:, None]
+                scaled = v / s_m
+                d = codebook_norms[None, :] - 2 * (scaled @ codebook.T)
+                idxs[mask, i] = np.argmin(d, axis=1).astype(np.uint8)
+
+            recon = codebook[idxs.reshape(-1)].reshape(b, 4, 8) * S[:, None, None]
+            total_sq_err += float(np.sum((recon - blk) ** 2))
+            total_sq_sig += float(np.sum(blk ** 2))
+
+            rec = np.zeros(b, dtype=out_dtype)
+            rec["scale"] = S.astype(np.float32)
+            rec["idx"] = idxs
+            f.write(rec.tobytes())
+
+    size_bytes = os.path.getsize(out_file)
     snr_db = 10 * np.log10(total_sq_sig / (total_sq_err + 1e-12))
-    print(f"    E8-16bit → {out_file}  ({num_blocks:,} blocks, "
-          f"{size_bytes:,} bytes, {size_mib:.2f} MiB, {size_mb:.2f} MB, "
-          f"SNR: {snr_db:.2f} dB)")
-    return size_mib, size_mb, snr_db
+    print(f"  -> {out_file}  ({num_blocks:,} blocks, {size_bytes:,} bytes, "
+          f"{size_bytes/1024/1024:.2f} MB, exact-decomposition SNR: {snr_db:.2f} dB "
+          f"[should be very high / near-lossless])")
+    return num_blocks, size_bytes, snr_db
+
 
 # ─────────────────────────────────────────────────────────────
-#  Helper: write E8 8-bit binary
-#  Block: float32 scale (4B) + 4 × uint8 indices (4B) = 8B
-#  Uses first 256 entries of the 16-bit codebook.
+# 4. Main
 # ─────────────────────────────────────────────────────────────
-def export_e8_8bit(all_flat, codebook_256, codebook_norms_256, out_file):
-    num_blocks = len(all_flat) // BLOCK_SIZE
-    blocks = all_flat.reshape(num_blocks, BLOCK_SIZE)
-    total_sq_err = 0.0
-    total_sq_sig = 0.0
-
-    with open(out_file, "wb") as f:
-        f.write(struct.pack("<I", num_blocks))
-        for i, block in enumerate(blocks):
-            if i % 200000 == 0:
-                print(f"      E8-8bit block {i:,}/{num_blocks:,}...")
-            max_val = float(np.max(np.abs(block)))
-            scale   = float(max_val / 2.0) if max_val > 1e-8 else 1e-8
-            subvecs = (block / scale).reshape(4, 8)
-            dots    = np.dot(codebook_256, subvecs.T)
-            dists   = codebook_norms_256[:, None] - 2 * dots
-            best    = np.argmin(dists, axis=0).astype(np.uint8)
-            recon   = codebook_256[best].flatten() * scale
-            total_sq_err += float(np.sum((recon - block)**2))
-            total_sq_sig += float(np.sum(block**2))
-            f.write(struct.pack("<f", scale))
-            f.write(best.tobytes())
-
-    size_bytes, size_mib, size_mb = get_size_mib_mb(out_file)
-    snr_db = 10 * np.log10(total_sq_sig / (total_sq_err + 1e-12))
-    print(f"    E8-8bit  → {out_file}  ({num_blocks:,} blocks, "
-          f"{size_bytes:,} bytes, {size_mib:.2f} MiB, {size_mb:.2f} MB, "
-          f"SNR: {snr_db:.2f} dB)")
-    return size_mib, size_mb, snr_db
-
-# ─────────────────────────────────────────────────────────────
-#  1. Build E8 codebooks
-# ─────────────────────────────────────────────────────────────
-print("="*60)
-print("Building E8 codebooks...")
-print("="*60)
-
-e8_points = []
-for p in itertools.product(range(-2, 3), repeat=8):
-    if sum(p) % 2 == 0 and sum(x**2 for x in p) <= 4:
-        e8_points.append(p)
-for p in itertools.product([-1.5, -0.5, 0.5, 1.5], repeat=8):
-    if int(sum(2*x for x in p)) % 2 == 0 and sum(x**2 for x in p) <= 4:
-        e8_points.append(p)
-
-e8_points = sorted(e8_points, key=lambda v: (sum(x**2 for x in v), v))
-
-# 16-bit codebook: 65536 entries
-codebook_16 = np.array(e8_points[:65536], dtype=np.float32)
-if len(codebook_16) < 65536:
-    codebook_16 = np.vstack([codebook_16,
-                  np.zeros((65536 - len(codebook_16), 8), dtype=np.float32)])
-norms_16 = np.sum(codebook_16**2, axis=1)
-
-# 8-bit codebook: first 256 entries of 16-bit codebook
-codebook_8  = codebook_16[:256].copy()
-norms_8     = norms_16[:256].copy()
-
-# Save both codebooks
-codebook_16.tofile("bert_codebook_e8_16bit.bin")
-codebook_8.tofile("bert_codebook_e8_8bit.bin")
-
-_, cb16_mib, cb16_mb = get_size_mib_mb("bert_codebook_e8_16bit.bin")
-_, cb8_mib, cb8_mb = get_size_mib_mb("bert_codebook_e8_8bit.bin")
-print(f"  16-bit codebook saved → bert_codebook_e8_16bit.bin  "
-      f"({cb16_mib:.2f} MiB, {cb16_mb:.2f} MB)")
-print(f"  8-bit  codebook saved → bert_codebook_e8_8bit.bin   "
-      f"({cb8_mib:.4f} MiB, {cb8_mb:.4f} MB)\n")
-
-# ─────────────────────────────────────────────────────────────
-#  2. Export all models
-# ─────────────────────────────────────────────────────────────
-MODELS = [
-    # {"name": "BERT-Base",      "id": "bert-base-uncased",
-    #  "fp32": "bert_full_fp32.bin",
-    #  "e8_16": "bert_full_e8_16bit.bin",
-    #  "e8_8" : "bert_full_e8_8bit.bin",
-    #  "do_e8": True},
-
-    # {"name": "TinyBERT (4L)",  "id": "huawei-noah/TinyBERT_General_4L_312D",
-    #  "fp32": "tinybert_full_fp32.bin",
-    #  "e8_16": "tinybert_full_e8_16bit.bin",
-    #  "e8_8" : "tinybert_full_e8_8bit.bin",
-    #  "do_e8": True},
-     {
-        "name": "TinyBERT-E8-QAD", 
-        "id": "student_model_lattice_e8", # This is your local checkpoint folder
-        "fp32": "tinybert_e8_qad_fp32.bin",
-        "e8_16": "tinybert_e8_qad_16bit.bin",
-        "e8_8" : "tinybert_e8_qad_8bit.bin",
-        "do_e8": True
-    },
-]
-
-summary = []
-for m in MODELS:
-    print(f"{'='*60}")
-    print(f"  {m['name']}  ({m['id']})")
-    print(f"{'='*60}")
-
-    model       = AutoModel.from_pretrained(m["id"])
+def main():
+    print("=" * 60)
+    print(f"Loading QAD checkpoint from {CKPT_DIR}/ ...")
+    print("=" * 60)
+    model = AutoModelForSequenceClassification.from_pretrained(CKPT_DIR)
     model.eval()
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Parameters : {total_params:,}")
 
-    all_flat = get_flat_weights(model)
-    del model
+    codebook = generate_e8_8bit_codebook()
+    codebook.tofile(OUT_CODEBOOK)
+    print(f"  Codebook saved -> {OUT_CODEBOOK} ({os.path.getsize(OUT_CODEBOOK)} bytes)\n")
 
-    # FP32
-    nb, fp32_mib, fp32_mb = export_fp32(all_flat, m["fp32"])
+    qad_names = get_qad_target_names(model)
+    sd = model.state_dict()
 
-    e8_16_mib = e8_16_mb = e8_8_mib = e8_8_mb = snr_16 = snr_8 = None
-    if m["do_e8"]:
-        e8_16_mib, e8_16_mb, snr_16 = export_e8_16bit(
-            all_flat, codebook_16, norms_16, m["e8_16"])
-        e8_8_mib, e8_8_mb, snr_8 = export_e8_8bit(
-            all_flat, codebook_8,  norms_8,  m["e8_8"])
+    quant_parts, plain_parts = [], []
+    for name, tensor in sd.items():
+        t = tensor.detach().cpu().float()
+        if name in qad_names:
+            assert t.dim() == 2, f"{name} expected a 2D Linear weight, got {tuple(t.shape)}"
+            O, I = t.shape
+            rem = I % BLOCK_SIZE
+            pad = (BLOCK_SIZE - rem) % BLOCK_SIZE
+            if pad:
+                # Per-row padding keeps block boundaries clean whenever
+                # a layer's row width wouldn't otherwise divide evenly
+                # by 32 (e.g. TinyBERT's 312), consistent with the
+                # careful handling used elsewhere in this pipeline.
+                t = torch.cat([t, torch.zeros(O, pad, dtype=t.dtype)], dim=1)
+            arr = t.numpy().astype(np.float32).flatten()
+            assert arr.size % BLOCK_SIZE == 0
+            quant_parts.append(arr)
+        else:
+            plain_parts.append(t.numpy().astype(np.float32).flatten())
 
-    summary.append({
-        "name": m["name"], "params": total_params,
-        "fp32_mib": fp32_mib, "fp32_mb": fp32_mb,
-        "e8_16_mib": e8_16_mib, "e8_16_mb": e8_16_mb, "snr_16": snr_16,
-        "e8_8_mib": e8_8_mib, "e8_8_mb": e8_8_mb, "snr_8": snr_8,
-    })
-    del all_flat
-    print()
+    quant_flat = np.concatenate(quant_parts)
+    plain_flat = np.concatenate(plain_parts) if plain_parts else np.array([], dtype=np.float32)
 
-# ─────────────────────────────────────────────────────────────
-#  3. Summary
-# ─────────────────────────────────────────────────────────────
-print("\n" + "="*96)
-print("  Export Summary  (sizes shown as MiB / MB)")
-print("="*96)
-print(f"  {'Model':<18} {'Params':>12} {'FP32':>18} {'E8-16bit':>18} "
-      f"{'SNR-16':>8} {'E8-8bit':>18} {'SNR-8':>8}")
-print(f"  {'-'*94}")
-for r in summary:
-    fp32_str = f"{r['fp32_mib']:.2f}/{r['fp32_mb']:.2f} MB"
-    e16 = f"{r['e8_16_mib']:.2f}/{r['e8_16_mb']:.2f} MB" if r['e8_16_mib'] else "—"
-    s16 = f"{r['snr_16']:.2f} dB" if r['snr_16'] else "—"
-    e8  = f"{r['e8_8_mib']:.2f}/{r['e8_8_mb']:.2f} MB" if r['e8_8_mib'] else "—"
-    s8  = f"{r['snr_8']:.2f} dB" if r['snr_8'] else "—"
-    print(f"  {r['name']:<18} {r['params']:>12,} "
-          f"{fp32_str:>18} {e16:>18} {s16:>8} {e8:>18} {s8:>8}")
-print("="*96)
+    print(f"Quantized core : {len(qad_names)} Linear-layer weight tensors, "
+          f"{quant_flat.size:,} params")
+    print(f"FP32 remainder : {len(sd) - len(qad_names)} tensors, "
+          f"{plain_flat.size:,} params (embeddings/layernorms/classifier/biases)\n")
 
-print("\nPush to emulator (use full adb path):")
-files = [
-    "bert_full_fp32.bin", "bert_full_e8_16bit.bin", "bert_full_e8_8bit.bin",
-    "bert_codebook_e8_16bit.bin", "bert_codebook_e8_8bit.bin",
-    "distilbert_full_fp32.bin", "mobilebert_full_fp32.bin",
-    "tinybert_full_fp32.bin",
-]
-for fn in files:
-    print(f"  adb push {fn} /data/local/tmp/")
+    nb, size_bytes, snr = export_lattice_8bit(quant_flat, codebook, OUT_QUANT)
+
+    plain_mb = plain_flat.size * 4 / (1024 * 1024)
+    total_mb = size_bytes / (1024 * 1024) + plain_mb
+    print(f"\nTotal model footprint (quantized core + FP32 remainder): "
+          f"{total_mb:.2f} MB  (remainder not written to disk, "
+          f"not pushed to device)")
+
+    print("\nPush to device (adb push):")
+    print(f"  adb push {OUT_QUANT} /data/local/tmp/")
+    print(f"  adb push {OUT_CODEBOOK} /data/local/tmp/")
+
+
+if __name__ == "__main__":
+    main()

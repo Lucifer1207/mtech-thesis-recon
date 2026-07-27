@@ -53,6 +53,9 @@ QAT_Scripts/full_model_benchmark_qat.cpp :- The purpose of full_model_benchmark_
 
 QAT_Scripts/stage_all_qat_normalization.py :- The purpose of the stage_qat_all_normalization.py script is to implement theoretically grounded, paper-compliant row-wise dynamic-range calibration for Lattice-based Quantization-Aware Training (QAT).
 
+
+QAT_Scripts/stage_all_qat_normalization_CLA.py :- This is same file like stage_all_qat_normalization.py, but this uses command line arguement to take epoch count as input from terminal like :- python3 stage_all_qat_normalization_CLA.py --epochs 3.
+
 QAT_Scripts/export_all_qat_models_normalization.py :- This script serves as the bridge between the statistical training domain and the hardware deployment domain. While your training script (stage_qat_all_normalization.py) learns weights using the paper’s row-wise statistical calibration ($\sigma_i$, $\beta_i$), those raw PyTorch tensors are not natively readable by a C++ inference engine.
 
 QAT_Scripts/full_model_benchmark_qat_normalization.cpp :- This script acts as the final "real-world" test to prove that your lattice-based model actually runs efficiently on an Android device.

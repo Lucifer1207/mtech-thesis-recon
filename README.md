@@ -34,6 +34,8 @@ TRAIN :    41,797 total | PII=3,386  | Non-PII=38,411
 VALIDATE : 4,644 total | PII=356  | Non-PII=4,288 
 TEST :     11,611 total | PII=910 | Non-PII=10,701 
 
+ReCon_pipeline/Stage2b_train_teacher_normalized.py :- This file is Fine-Tuning BERT-Base FP32 model + normalization . this is required because when we'll run stage_e8_qad_both_teacher_student_normalized.py script then we want teacher also normalized, hence this script's output will be used there.
+
 ReCon_pipeline/stage_e8_qad.py :- This file is final step of ReCon pipeline. This trains student model(TinyBERT), using E8 Lattice Vector Quantization and using teacher_prob file(that gets generated after Stage2b). The teacher_model used here is:- FineTuned Teacher model(Bert-BASE) on cleaned dataset, that gets saved after Stage2b.
 
 ReCon_pipeline/stage_e8_qad_overload_diagnostic.py :- This is same file as that of stage_e8_qad.py but in this we're calculating how many weights after normalization are outside the codebook range.

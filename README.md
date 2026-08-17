@@ -64,6 +64,8 @@ QAT_Scripts/stage_all_qat_normalization.py :- The purpose of the stage_qat_all_n
 
 QAT_Scripts/stage_all_qat_normalization_CLA.py :- This is same file like stage_all_qat_normalization.py, but this uses command line arguement to take epoch count as input from terminal like :- python3 stage_all_qat_normalization_CLA.py --epochs 3.
 
+QAT_Scripts/stage_qat_all_normalization_literal_ymax.py :- What it does: Y_max follows the paper's literal Appendix A.3 formula, Y_max = Δ0·(qᴹ−1)/2, with q=8, M=1, Δ0=1.5 (paper-matching values). Question it answers: "What happens if we follow the paper's formula exactly, on our small fixed codebook".
+
 QAT_Scripts/export_all_qat_models_normalization.py :- This script serves as the bridge between the statistical training domain and the hardware deployment domain. While your training script (stage_qat_all_normalization.py) learns weights using the paper’s row-wise statistical calibration ($\sigma_i$, $\beta_i$), those raw PyTorch tensors are not natively readable by a C++ inference engine.
 
 QAT_Scripts/full_model_benchmark_qat_normalization.cpp :- This script acts as the final "real-world" test to prove that your lattice-based model actually runs efficiently on an Android device.

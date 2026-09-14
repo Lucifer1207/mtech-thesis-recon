@@ -44,6 +44,8 @@ ReCon_pipeline/stage_e8_qad_student_normalized.py :- This is same file as that o
 
 ReCon_pipeline/stage_e8_qad_both_teacher_student_normalized.py :- This is same file as that of stage_e8_qad.py but in this we're using normalization for noth teacher and student models + we're calculating how many weights after normalization are outside the codebook range.
 
+ReCon_pipeline/stage_e8_qad_both_norm_literal_8bits.py :- This is QAD script that is using normalization formula of Rishika ma'am's research paper. 
+
 ReCon_pipeline/export_qad_recon_models.py :- this file is used to create .bin for student_model_lattice_e8(that gets created after stage_e8_qad.py run. This student_model_lattice_e8 is trained QAD student(TinyBERT) using teacher as BERT-Base.
 
 ReCon_pipeline/full_model_benchmark_recon.cpp :- Its primary purpose is to measure and verify how these models behave when executed on a target architecture (such as an Android device via adb). It basically creates ELF file.  

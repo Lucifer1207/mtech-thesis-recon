@@ -1,3 +1,6 @@
+### Result Sheet link :- https://docs.google.com/spreadsheets/d/16SHywzv3qqChxlDfZd0jvNflbvdHNw73zYUgECQ67AM/edit?gid=2054867344#gid=2054867344
+
+
 e8_codebook.py :- Python script for codebook formation.
 
 export_all_models_v2.py :- The primary purpose of export_all_models_v2.py is to extract, quantize(E8 Lattice Vector Quantiation), and serialize the weights of multiple Transformer models (such as BERT-Base and TinyBERT) into raw binary configuration files (.bin) for cross-architecture or mobile deployment.
